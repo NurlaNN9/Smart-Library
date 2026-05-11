@@ -1,7 +1,8 @@
-#   - Window 1: list of books loaded from FastAPI (GET /books)
-#   - Window 2: form that sends a new book to FastAPI (POST /books)
-#   - Switch between windows using ft.NavigationBar
-#   - Show success / error messages with SnackBar
+# ============================================================
+# Smart Library UI - Lab 9 (Navigation & Data Submission)
+# - Window 1: Books List (GET)
+# - Window 2: Add New Book (POST)
+# - Feedback: SnackBar messages
 #
 # How to run:
 #   1) Start the API in one terminal:

@@ -1,8 +1,7 @@
-#   - Add a POST endpoint that inserts a new book into SQLite3
-#   - Validate the incoming JSON with a Pydantic model
-#   - Handle duplicate IDs with a clear error message
-#   - Keep the GET endpoint from Lab 8 so the Flet table
-#     can be refreshed after each insert
+# Smart Library API - Lab 9 (POST & SQLite Integration)
+# - Endpoint: GET /books (list) & POST /books (insert)
+# - Validation: Pydantic models
+
 # ===========================
 # How to run:
 #   pip install fastapi uvicorn requests
