@@ -1,19 +1,9 @@
-# ============================================================
-# LABORATORY WORK #9
-# "Sending Data via FastAPI + SQLite3 (POST) and
-#  Navigation Between Windows"
-# ------------------------------------------------------------
-# Project: Smart Library
-# File:    api.py   (Lab 9 — extends Lab 8 with POST)
-#
-# Goal of LAB 9:
 #   - Add a POST endpoint that inserts a new book into SQLite3
 #   - Validate the incoming JSON with a Pydantic model
 #   - Handle duplicate IDs with a clear error message
 #   - Keep the GET endpoint from Lab 8 so the Flet table
 #     can be refreshed after each insert
-# ============================================================
-#
+# ===========================
 # How to run:
 #   pip install fastapi uvicorn requests
 #   uvicorn api:app --reload --port 8000

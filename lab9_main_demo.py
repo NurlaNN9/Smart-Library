@@ -1,12 +1,3 @@
-# ============================================================
-# LABORATORY WORK #9
-# "Sending Data via FastAPI + SQLite3 (POST) and
-#  Navigation Between Windows"
-# ------------------------------------------------------------
-# Project: Smart Library
-# File:    main.py   (Lab 9 — Flet client with NavigationBar)
-#
-# Goal of LAB 9 (client side):
 #   - Window 1: list of books loaded from FastAPI (GET /books)
 #   - Window 2: form that sends a new book to FastAPI (POST /books)
 #   - Switch between windows using ft.NavigationBar
@@ -14,9 +5,9 @@
 #
 # How to run:
 #   1) Start the API in one terminal:
-#        uvicorn api:app --reload --port 8000
+#        uvicorn lab9_api:app --reload --port 8000
 #   2) Start this Flet app in another terminal:
-#        python main.py
+#        python lab9_main_demo.py
 # ============================================================
 
 import flet as ft
