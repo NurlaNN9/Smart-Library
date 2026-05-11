@@ -18,6 +18,81 @@ def init_db():
             created  TEXT    DEFAULT (datetime('now'))
         )
     """)
+    # Add is_admin column if missing (idempotent migration)
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    # Auto-promote the very first registered user to admin
+    c.execute("UPDATE users SET is_admin=1 WHERE id=(SELECT MIN(id) FROM users)")
+    # Books admin table (CRUD)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS books (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            title   TEXT NOT NULL,
+            author  TEXT NOT NULL,
+            genre   TEXT DEFAULT '',
+            tag     TEXT DEFAULT 'Physical',
+            cover   TEXT DEFAULT '',
+            created TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# ─── Books CRUD helpers ──────────────────────────────────────
+def db_books_all():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, title, author, genre, tag, cover FROM books ORDER BY id DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def db_book_create(title, author, genre, tag, cover):
+    if not title.strip() or not author.strip():
+        return False, "Title and Author are required."
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO books (title, author, genre, tag, cover) VALUES (?, ?, ?, ?, ?)",
+              (title.strip(), author.strip(), genre.strip(), tag.strip() or "Physical", cover.strip()))
+    conn.commit()
+    conn.close()
+    return True, "Book added."
+
+def db_book_update(book_id, title, author, genre, tag, cover):
+    if not title.strip() or not author.strip():
+        return False, "Title and Author are required."
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE books SET title=?, author=?, genre=?, tag=?, cover=? WHERE id=?",
+              (title.strip(), author.strip(), genre.strip(), tag.strip() or "Physical", cover.strip(), book_id))
+    conn.commit()
+    conn.close()
+    return True, "Book updated."
+
+def db_book_to_dict(row):
+    bid, title, author, genre, tag, cover = row
+    return {
+        "id": bid,
+        "title": title,
+        "author": author,
+        "genre": genre or "Other",
+        "tag": tag or "Physical",
+        "tag_col": "#22c55e" if (tag or "").lower() == "e-book" else "#6c63ff",
+        "cover": cover or "",
+        "icon": "menu_book",
+        "_source": "db",
+    }
+
+def all_books():
+    # DB-added books appear first (newest first), then the seeded catalog
+    return [db_book_to_dict(r) for r in db_books_all()] + BOOKS
+
+def db_book_delete(book_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM books WHERE id=?", (book_id,))
     conn.commit()
     conn.close()
 
@@ -30,6 +105,8 @@ def db_register(username, email, password):
         c = conn.cursor()
         c.execute("INSERT INTO users (username, email, password) VALUES (?, ?, ?)",
                   (username.strip(), email.strip().lower(), hash_password(password)))
+        # First-ever user becomes admin
+        c.execute("UPDATE users SET is_admin=1 WHERE id=(SELECT MIN(id) FROM users)")
         conn.commit()
         conn.close()
         return True, "Account created!"
@@ -42,26 +119,64 @@ def db_login(username_or_email, password):
     c = conn.cursor()
     val = username_or_email.strip().lower()
     c.execute(
-        "SELECT id, username, email FROM users WHERE (LOWER(username)=? OR LOWER(email)=?) AND password=?",
+        "SELECT id, username, email, COALESCE(is_admin,0) FROM users WHERE (LOWER(username)=? OR LOWER(email)=?) AND password=?",
         (val, val, hash_password(password))
     )
     row = c.fetchone()
     conn.close()
     if row:
-        return True, "Welcome back!", {"id": row[0], "username": row[1], "email": row[2]}
+        return True, "Welcome back!", {"id": row[0], "username": row[1], "email": row[2], "is_admin": bool(row[3])}
     return False, "Invalid username or password.", {}
+
+def db_update_profile(user_id, new_username, new_email, new_password=None):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        if new_password:
+            c.execute("UPDATE users SET username=?, email=?, password=? WHERE id=?",
+                      (new_username.strip(), new_email.strip().lower(), hash_password(new_password), user_id))
+        else:
+            c.execute("UPDATE users SET username=?, email=? WHERE id=?",
+                      (new_username.strip(), new_email.strip().lower(), user_id))
+        conn.commit()
+        conn.close()
+        return True, "Profile updated!"
+    except sqlite3.IntegrityError as e:
+        msg = "Username already taken." if "username" in str(e) else "Email already in use."
+        return False, msg
+
+def user_stats(user):
+    """Deterministic per-user dashboard numbers (stable across logins)."""
+    uid = int(user.get("id", 0) or 0)
+    seed = (uid * 2654435761) & 0xFFFFFFFF
+    physical   = 1 + (seed >> 3) % 5            # 1..5
+    digital    = 1 + (seed >> 7) % 4            # 1..4
+    total      = physical + digital
+    ebook_rd   = 4 + (seed >> 11) % 18          # 4..21
+    pages      = 40 + (seed >> 5) % 260         # 40..299
+    goal_done  = 1 + (seed >> 13) % 9           # 1..9
+    goal_total = 10
+    fee_cents  = (seed >> 4) % 4200             # $0.00..$41.99
+    member_id  = f"SL-{1000 + uid:04d}-{2024 + (uid % 3)}"
+    return {
+        "physical": physical, "digital": digital, "total": total,
+        "ebook_reads": ebook_rd, "pages_read": pages,
+        "goal_done": goal_done, "goal_total": goal_total,
+        "late_fee": fee_cents / 100.0, "member_id": member_id,
+    }
+
 
 init_db()
 
 
 # ─── Colour tokens ────────────────────────────────────────────
-LIGHT_BG_DARK = "#f5f7fb"
-LIGHT_BG_CARD = "#ffffff"
-LIGHT_BG_NAV = "#eef2f7"
-LIGHT_TEXT_PRI = "#1f2937"
-LIGHT_TEXT_SEC = "#6b7280"
-LIGHT_BORDER = "#d1d5db"
-LIGHT_PALE_PURP = "#4f46e5"
+LIGHT_BG_DARK = "#eaeef6"      # page background — soft cool gray
+LIGHT_BG_CARD = "#ffffff"      # cards / surfaces (search field, panels)
+LIGHT_BG_NAV  = "#f4f6fb"      # navbar — slightly darker than cards
+LIGHT_TEXT_PRI = "#111827"     # near-black for strong contrast
+LIGHT_TEXT_SEC = "#5b6478"     # muted slate
+LIGHT_BORDER   = "#dbe0eb"     # soft cool border
+LIGHT_PALE_PURP = "#6c63ff"    # accent-tinted text (matches ACCENT)
 #------------------------
 BG_DARK   = "#0f0f13"
 BG_CARD   = "#1a1a24"
@@ -520,21 +635,30 @@ def auth_page(page: ft.Page, on_success):
     toggle_ref = ft.Ref[ft.TextButton]()
     email_row_ref = ft.Ref[ft.Container]()
     confirm_row_ref = ft.Ref[ft.Container]()
+    err_box_ref = ft.Ref[ft.Container]()
 
     def field(hint, icon, password=False, ref=None):
         return ft.TextField(
             ref=ref, hint_text=hint, password=password, can_reveal_password=password,
-            prefix_icon=icon, border=ft.InputBorder.OUTLINE, border_color=BORDER,
-            focused_border_color=ACCENT, color=TEXT_PRI,
-            hint_style=ft.TextStyle(color=TEXT_SEC), bgcolor=BG_CARD,
-            border_radius=10, text_size=13, cursor_color=ACCENT,
-            content_padding=ft.Padding(left=14, right=14, top=14, bottom=14),
+            prefix_icon=icon, border=ft.InputBorder.OUTLINE, border_color="#2f3250",
+            focused_border_color=ACCENT2, color=TEXT_PRI,
+            hint_style=ft.TextStyle(color=TEXT_SEC), bgcolor="#15151f",
+            border_radius=12, text_size=13, cursor_color=ACCENT2, height=52,
+            content_padding=ft.Padding(left=16, right=16, top=14, bottom=14),
         )
 
     def show_err(msg, ok=False):
         err_ref.current.value = msg
         err_ref.current.color = TAG_EBOOK if ok else ft.Colors.RED_300
-        err_ref.current.update()
+        if err_box_ref.current:
+            if not msg:
+                err_box_ref.current.visible = False
+            else:
+                err_box_ref.current.visible = True
+                tint = TAG_EBOOK if ok else ft.Colors.RED_400
+                err_box_ref.current.bgcolor = ft.Colors.with_opacity(0.12, tint)
+                err_box_ref.current.border = ba(1, ft.Colors.with_opacity(0.35, tint))
+        page.update()
 
     def switch_mode(e=None):
         state["mode"] = "signup" if state["mode"] == "login" else "login"
@@ -555,10 +679,16 @@ def auth_page(page: ft.Page, on_success):
 
     def do_submit(e=None):
         username = usr_ref.current.value.strip()
-        password = pwd_ref.current.value
+        password = pwd_ref.current.value or ""
+
         if state["mode"] == "login":
             if not username or not password:
-                show_err("Please fill in all fields."); return
+                show_err("Please fill in all fields.")
+                return
+            if " " in username or " " in password:
+                show_err("Username and password must not contain spaces.")
+                return
+
             ok, msg, user = db_login(username, password)
             if ok:
                 show_err(msg, ok=True)
@@ -566,17 +696,43 @@ def auth_page(page: ft.Page, on_success):
                 on_success(page, user)
             else:
                 show_err(msg)
+
         else:
             email = email_ref.current.value.strip()
-            confirm = confirm_ref.current.value
+            confirm = confirm_ref.current.value or ""
+
             if not username or not email or not password or not confirm:
-                show_err("Please fill in all fields."); return
-            if "@" not in email:
-                show_err("Enter a valid email address."); return
+                show_err("Please fill in all fields.")
+                return
+
+            if " " in username:
+                show_err("Username must not contain spaces.")
+                return
+
+            if len(username) < 3:
+                show_err("Username must be at least 3 characters.")
+                return
+
+            if not all(c.isalnum() or c in "_-." for c in username):
+                show_err("Username can only contain letters, numbers, '_', '-' and '.'")
+                return
+
+            if " " in email or "@" not in email or "." not in email.split("@")[-1]:
+                show_err("Enter a valid email address.")
+                return
+
+            if " " in password:
+                show_err("Password must not contain spaces.")
+                return
+
             if len(password) < 6:
-                show_err("Password must be at least 6 characters."); return
+                show_err("Password must be at least 6 characters.")
+                return
+
             if password != confirm:
-                show_err("Passwords do not match."); return
+                show_err("Passwords do not match.")
+                return
+
             ok, msg = db_register(username, email, password)
             if ok:
                 show_err(msg, ok=True)
@@ -585,68 +741,293 @@ def auth_page(page: ft.Page, on_success):
             else:
                 show_err(msg)
 
+    def feature_card(value, label, icon):
+        return ft.Container(
+            expand=True,
+            padding=ft.Padding(left=16, top=18, right=16, bottom=18),
+            bgcolor=ft.Colors.with_opacity(0.55, "#1c2140"),
+            border=ba(1, ft.Colors.with_opacity(0.35, ACCENT2)),
+            border_radius=16,
+            content=ft.Column(
+                spacing=10,
+                controls=[
+                    ft.Container(
+                        width=32, height=32, border_radius=10,
+                        bgcolor=ft.Colors.with_opacity(0.18, ACCENT2),
+                        alignment=ft.Alignment(0, 0),
+                        content=ft.Icon(icon, color=ACCENT2, size=18),
+                    ),
+                    ft.Text(value, size=22, weight=ft.FontWeight.BOLD, color=TEXT_PRI),
+                    ft.Text(label, size=11, color="#b7bfd8"),
+                ],
+            ),
+        )
+
+    def label(text):
+        return ft.Text(
+            text.upper(), size=11, color=TEXT_SEC,
+            weight=ft.FontWeight.W_600,
+            spans=None,
+        )
+
     card = ft.Container(
-        width=420, bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=16, padding=pa(36),
-        content=ft.Column(spacing=0, controls=[
-            ft.Row([
-                ft.Container(content=ft.Icon(ft.Icons.AUTO_STORIES, color=ft.Colors.WHITE, size=18),
-                             bgcolor=ACCENT, border_radius=6, padding=pa(6)),
-                ft.Text("Smart Library", size=16, weight=ft.FontWeight.BOLD, color=TEXT_PRI),
-            ], spacing=10),
-            ft.Container(height=24),
-            ft.Text(ref=title_ref, value="Welcome Back", size=26, weight=ft.FontWeight.BOLD, color=TEXT_PRI),
-            ft.Container(height=4),
-            ft.Text(ref=sub_ref, value="Sign in to your library", size=13, color=TEXT_SEC),
-            ft.Container(height=28),
-            ft.Text("Username or Email", size=12, color=TEXT_SEC, weight=ft.FontWeight.W_500),
-            ft.Container(height=6),
-            field("Enter username or email", ft.Icons.PERSON_OUTLINE, ref=usr_ref),
-            ft.Container(height=14),
-            ft.Container(ref=email_row_ref, visible=False, content=ft.Column(spacing=0, controls=[
-                ft.Text("Email Address", size=12, color=TEXT_SEC, weight=ft.FontWeight.W_500),
+        width=460,
+        padding=pa(40),
+        gradient=ft.LinearGradient(
+            begin=ft.Alignment(0, -1), end=ft.Alignment(0, 1),
+            colors=["#1c1c28", "#141420"],
+        ),
+        border=ba(1, ft.Colors.with_opacity(0.30, ACCENT2)),
+        border_radius=24,
+        shadow=ft.BoxShadow(
+            blur_radius=50, spread_radius=2,
+            color=ft.Colors.with_opacity(0.30, ACCENT),
+            offset=ft.Offset(0, 16),
+        ),
+        content=ft.Column(
+            spacing=0,
+            controls=[
+                ft.Row(
+                    [
+                        ft.Container(
+                            width=48, height=48, border_radius=14,
+                            gradient=ft.LinearGradient(
+                                begin=ft.Alignment(-1, -1), end=ft.Alignment(1, 1),
+                                colors=[ACCENT2, ACCENT],
+                            ),
+                            shadow=ft.BoxShadow(
+                                blur_radius=18, spread_radius=0,
+                                color=ft.Colors.with_opacity(0.45, ACCENT),
+                                offset=ft.Offset(0, 6),
+                            ),
+                            content=ft.Icon(ft.Icons.AUTO_STORIES_ROUNDED,
+                                            color=ft.Colors.WHITE, size=24),
+                            alignment=ft.Alignment(0, 0),
+                        ),
+                        ft.Column(
+                            spacing=2,
+                            controls=[
+                                ft.Text("Smart Library", size=18,
+                                        weight=ft.FontWeight.BOLD, color=TEXT_PRI),
+                                ft.Text("Organize your reading life",
+                                        size=11, color=TEXT_SEC),
+                            ],
+                        ),
+                    ],
+                    spacing=14,
+                ),
+                ft.Container(height=32),
+                ft.Text(ref=title_ref, value="Welcome Back",
+                        size=30, weight=ft.FontWeight.BOLD, color=TEXT_PRI),
                 ft.Container(height=6),
-                field("Enter your email", ft.Icons.EMAIL_OUTLINED, ref=email_ref),
-                ft.Container(height=14),
-            ])),
-            ft.Text("Password", size=12, color=TEXT_SEC, weight=ft.FontWeight.W_500),
-            ft.Container(height=6),
-            field("Enter password", ft.Icons.LOCK_OUTLINE, password=True, ref=pwd_ref),
-            ft.Container(height=14),
-            ft.Container(ref=confirm_row_ref, visible=False, content=ft.Column(spacing=0, controls=[
-                ft.Text("Confirm Password", size=12, color=TEXT_SEC, weight=ft.FontWeight.W_500),
+                ft.Text(
+                    ref=sub_ref,
+                    value="Sign in to continue your library journey.",
+                    size=13, color=TEXT_SEC,
+                ),
+                ft.Container(height=28),
+
+                label("Username or Email"),
                 ft.Container(height=6),
-                field("Re-enter password", ft.Icons.LOCK_RESET_OUTLINED, password=True, ref=confirm_ref),
+                field("Enter username or email", ft.Icons.PERSON_OUTLINE, ref=usr_ref),
+
+                ft.Container(
+                    ref=email_row_ref,
+                    visible=False,
+                    content=ft.Column(
+                        spacing=0,
+                        controls=[
+                            ft.Container(height=14),
+                            label("Email Address"),
+                            ft.Container(height=6),
+                            field("Enter your email", ft.Icons.EMAIL_OUTLINED, ref=email_ref),
+                        ],
+                    ),
+                ),
+
                 ft.Container(height=14),
-            ])),
-            ft.Text(ref=err_ref, value="", size=12, color=ft.Colors.RED_300),
-            ft.Container(height=10),
-            ft.FilledButton("Sign In", ref=btn_ref, width=float("inf"), height=44,
-                            on_click=do_submit,
-                            style=ft.ButtonStyle(bgcolor=ACCENT, color=ft.Colors.WHITE,
-                                                 shape=ft.RoundedRectangleBorder(radius=10))),
-            ft.Container(height=16),
-            ft.Row([ft.TextButton(
-                ref=toggle_ref,
-                content=ft.Text("Don't have an account? Sign Up", size=12, color=ACCENT),
-                on_click=switch_mode,
-            )], alignment=ft.MainAxisAlignment.CENTER),
-        ])
+                label("Password"),
+                ft.Container(height=6),
+                field("Enter password", ft.Icons.LOCK_OUTLINE, password=True, ref=pwd_ref),
+
+                ft.Container(
+                    ref=confirm_row_ref,
+                    visible=False,
+                    content=ft.Column(
+                        spacing=0,
+                        controls=[
+                            ft.Container(height=14),
+                            label("Confirm Password"),
+                            ft.Container(height=6),
+                            field("Re-enter password", ft.Icons.LOCK_RESET_OUTLINED,
+                                  password=True, ref=confirm_ref),
+                        ],
+                    ),
+                ),
+
+                ft.Container(height=18),
+                ft.Container(
+                    ref=err_box_ref,
+                    visible=False,
+                    padding=ft.Padding(left=12, right=12, top=10, bottom=10),
+                    border_radius=10,
+                    content=ft.Text(ref=err_ref, value="", size=12,
+                                    color=ft.Colors.RED_300),
+                ),
+                ft.Container(height=14),
+
+                ft.Container(
+                    width=float("inf"),
+                    height=52,
+                    border_radius=14,
+                    gradient=ft.LinearGradient(
+                        begin=ft.Alignment(-1, 0), end=ft.Alignment(1, 0),
+                        colors=[ACCENT, ACCENT2],
+                    ),
+                    shadow=ft.BoxShadow(
+                        blur_radius=22, spread_radius=0,
+                        color=ft.Colors.with_opacity(0.50, ACCENT),
+                        offset=ft.Offset(0, 10),
+                    ),
+                    content=ft.FilledButton(
+                        "Sign In",
+                        ref=btn_ref,
+                        width=float("inf"),
+                        height=52,
+                        on_click=do_submit,
+                        style=ft.ButtonStyle(
+                            bgcolor=ft.Colors.TRANSPARENT,
+                            color=ft.Colors.WHITE,
+                            overlay_color=ft.Colors.with_opacity(0.10, ft.Colors.WHITE),
+                            elevation=0,
+                            shape=ft.RoundedRectangleBorder(radius=14),
+                        ),
+                    ),
+                ),
+
+                ft.Container(height=16),
+                ft.Row(
+                    [
+                        ft.TextButton(
+                            ref=toggle_ref,
+                            content=ft.Text(
+                                "Don't have an account? Sign Up",
+                                size=12, color=ACCENT2,
+                                weight=ft.FontWeight.W_500,
+                            ),
+                            on_click=switch_mode,
+                        )
+                    ],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                ),
+            ],
+        ),
     )
 
-    page.add(ft.Container(
-        expand=True, bgcolor=BG_DARK,
-        content=ft.Column([card], alignment=ft.MainAxisAlignment.CENTER,
-                          horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-        padding=pa(20),
-    ))
+    right_panel = ft.Container(
+        expand=True,
+        border_radius=28,
+        padding=pa(44),
+        gradient=ft.LinearGradient(
+            begin=ft.Alignment(-1, -1), end=ft.Alignment(1, 1),
+            colors=["#191d33", "#0e1224"],
+        ),
+        border=ba(1, "#252b45"),
+        content=ft.Column(
+            alignment=ft.MainAxisAlignment.CENTER,
+            spacing=20,
+            controls=[
+                ft.Container(
+                    padding=ft.Padding(left=14, top=8, right=14, bottom=8),
+                    bgcolor=ft.Colors.with_opacity(0.12, ACCENT2),
+                    border=ba(1, ft.Colors.with_opacity(0.30, ACCENT2)),
+                    border_radius=999,
+                    content=ft.Text("Smart reading dashboard",
+                                    size=12, color="#d8d1ff",
+                                    weight=ft.FontWeight.W_500),
+                ),
+                ft.Text(
+                    "Your reading world,\norganized in one place.",
+                    size=40, weight=ft.FontWeight.BOLD, color=TEXT_PRI,
+                ),
+                ft.Text(
+                    "Manage books, digital reading, and personal collections "
+                    "with a cleaner and more modern experience.",
+                    size=14, color="#c0c6dc", max_lines=3,
+                ),
+                ft.Container(height=10),
+                ft.Row(
+                    controls=[
+                        feature_card("120+", "Books tracked", ft.Icons.MENU_BOOK_ROUNDED),
+                        feature_card("24/7", "Digital access", ft.Icons.TABLET_MAC_ROUNDED),
+                        feature_card("Fast", "Smart search", ft.Icons.SEARCH_ROUNDED),
+                    ],
+                    spacing=14,
+                ),
+            ],
+        ),
+    )
+
+    page.add(
+        ft.Container(
+            expand=True,
+            padding=pa(24),
+            content=ft.Stack(
+                controls=[
+                    ft.Container(
+                        expand=True,
+                        gradient=ft.RadialGradient(
+                            center=ft.Alignment(-0.6, -0.6),
+                            radius=1.4,
+                            colors=[
+                                ft.Colors.with_opacity(0.30, ACCENT),
+                                BG_DARK,
+                            ],
+                        ),
+                    ),
+                    ft.Container(
+                        expand=True,
+                        gradient=ft.RadialGradient(
+                            center=ft.Alignment(0.8, 0.7),
+                            radius=1.1,
+                            colors=[
+                                ft.Colors.with_opacity(0.22, ACCENT2),
+                                ft.Colors.TRANSPARENT,
+                            ],
+                        ),
+                    ),
+                    ft.ResponsiveRow(
+                        controls=[
+                            ft.Container(col={"xs": 12, "md": 5}, content=card),
+                            ft.Container(col={"xs": 0, "md": 7}, content=right_panel),
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ]
+            ),
+        )
+    )
 
 
 
 def main(page: ft.Page, user: dict = None):
     if user is None:
-        user = {"username": "Guest", "email": ""}
+        user = {"username": "Guest", "email": "", "id": 0, "is_admin": False}
+    user.setdefault("is_admin", False)
     logged_user = user["username"]
     logged_initials = "".join(w[0].upper() for w in logged_user.split()[:2]) or "U"
+    stats = user_stats(user)
+    raw_is_admin = bool(user.get("is_admin"))
+    view_as_user = bool(user.get("view_as_user"))
+    is_admin = raw_is_admin and not view_as_user
+
+    def switch_to_user_view(e=None):
+        user["view_as_user"] = True
+        set_active_page("Dashboard")
+
+    def switch_to_admin_view(e=None):
+        user["view_as_user"] = False
+        set_active_page("Dashboard")
 
     page.title = "Smart Library"
     page.theme_mode = ft.ThemeMode.DARK
@@ -695,7 +1076,7 @@ def main(page: ft.Page, user: dict = None):
     def toggle_theme(e):
         page.theme_dark = not page.theme_dark
         page.clean()
-        main(page)
+        main(page, user)
 
     apply_theme()
 
@@ -710,7 +1091,7 @@ def main(page: ft.Page, user: dict = None):
     def filtered():
         q, cat = state["q"], state["cat"]
         books = [
-            b for b in BOOKS
+            b for b in all_books()
             if (cat == "All" or b["genre"] == cat)
             and matches_prefix_query(b, q)
         ]
@@ -721,25 +1102,29 @@ def main(page: ft.Page, user: dict = None):
         if not q:
             return []
         matches = [
-            b for b in BOOKS
+            b for b in all_books()
             if matches_prefix_query(b, q)
         ]
         return sorted(matches, key=lambda b: search_priority(b, q))[:limit]
 
     def dashboard_recommended_books():
         # Keep dashboard recommendations stable; do not change by navbar search.
-        return BOOKS[55:63] if len(BOOKS) >= 63 else BOOKS[-8:]
+        books = all_books()
+        db_added = [b for b in books if b.get("_source") == "db"]
+        base = BOOKS[55:63] if len(BOOKS) >= 63 else BOOKS[-8:]
+        return (db_added + base)[:8]
 
     def dashboard_recent_digital_books():
         # Safe slice to avoid index errors when dataset size changes.
-        recent_books = [b for b in BOOKS if b.get("tag") == "E-Book"][-4:]
+        books = all_books()
+        recent_books = [b for b in books if b.get("tag") == "E-Book"][:4]
         if len(recent_books) < 4:
-            recent_books = BOOKS[-4:]
+            recent_books = (recent_books + books)[:4]
         time_labels = ["2 hours ago", "Yesterday", "3 days ago", "1 week ago"]
         pairs = list(zip(recent_books, time_labels))
         if len(pairs) < 4:
             missing = 4 - len(pairs)
-            filler_books = BOOKS[:missing]
+            filler_books = books[:missing]
             pairs.extend(zip(filler_books, time_labels[len(pairs):]))
         return pairs
 
@@ -815,7 +1200,68 @@ def main(page: ft.Page, user: dict = None):
                     await asyncio.sleep(0.1)
                     reload_users()
                 page.run_task(delayed_reload)
+            elif target == "AdminBooks":
+                import asyncio
+                async def delayed_reload_books():
+                    await asyncio.sleep(0.1)
+                    reload_books()
+                page.run_task(delayed_reload_books)
     
+    def open_profile_dialog(e=None):
+        def close_dlg(e=None):
+            dlg.open = False
+            page.update()
+
+        def logout_from_dlg(e):
+            dlg.open = False
+            page.update()
+            do_logout(e)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            bgcolor=BG_CARD,
+            shape=ft.RoundedRectangleBorder(radius=18),
+            title=ft.Row([
+                ft.CircleAvatar(content=ft.Text(logged_initials, size=14, weight=ft.FontWeight.BOLD),
+                                bgcolor=ACCENT, color=ft.Colors.WHITE, radius=22),
+                ft.Column([
+                    ft.Text(logged_user, size=15, weight=ft.FontWeight.BOLD, color=TEXT_PRI),
+                    ft.Text(user.get("email", ""), size=11, color=TEXT_SEC),
+                ], spacing=2),
+            ], spacing=12),
+            content=ft.Container(
+                width=320,
+                content=ft.Column([
+                    ft.Container(height=4),
+                    ft.Container(
+                        padding=pa(10),
+                        bgcolor=ft.Colors.with_opacity(0.15, ACCENT2),
+                        border_radius=10,
+                        content=ft.Row([
+                            ft.Icon(ft.Icons.WORKSPACE_PREMIUM, color="#DAA520", size=18),
+                            ft.Text("GOLD MEMBER", size=11, weight=ft.FontWeight.BOLD, color="#DAA520"),
+                        ], spacing=8),
+                    ),
+                    ft.Container(height=6),
+                    ft.Row([ft.Icon(ft.Icons.PERSON_OUTLINE, size=16, color=TEXT_SEC),
+                            ft.Text(f"Username: {logged_user}", size=12, color=TEXT_PRI)], spacing=8),
+                    ft.Row([ft.Icon(ft.Icons.MAIL_OUTLINE, size=16, color=TEXT_SEC),
+                            ft.Text(f"Email: {user.get('email','—')}", size=12, color=TEXT_PRI)], spacing=8),
+                ], spacing=8, tight=True),
+            ),
+            actions=[
+                ft.TextButton("Cancel", on_click=close_dlg,
+                              style=ft.ButtonStyle(color=TEXT_SEC)),
+                ft.ElevatedButton("Log Out", icon=ft.Icons.LOGOUT, on_click=logout_from_dlg,
+                                  style=ft.ButtonStyle(bgcolor=ft.Colors.RED_400, color=ft.Colors.WHITE,
+                                                       shape=ft.RoundedRectangleBorder(radius=10))),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
     def do_logout(e):
         import asyncio
         async def _logout_task():
@@ -839,7 +1285,11 @@ def main(page: ft.Page, user: dict = None):
             ft.Row([
                 nav_link("Dashboard", state["active_page"] == "Dashboard", lambda e: set_active_page("Dashboard")),
                 nav_link("Books", state["active_page"] == "Books", lambda e: set_active_page("Books")),
-                nav_link("Settings", state["active_page"] == "Settings", lambda e: set_active_page("Settings")),
+                nav_link("My Books", state["active_page"] == "MyBooks", lambda e: set_active_page("MyBooks")),
+                nav_link("Fines", state["active_page"] == "Fines", lambda e: set_active_page("Fines")),
+                nav_link("Profile", state["active_page"] == "Profile", lambda e: set_active_page("Profile")),
+                *([nav_link("Settings", state["active_page"] == "Settings", lambda e: set_active_page("Settings"))] if is_admin else []),
+                *([nav_link("Manage Books", state["active_page"] == "AdminBooks", lambda e: set_active_page("AdminBooks"))] if is_admin else []),
             ], spacing=20),
             ft.Container(expand=True),
             ft.Container(width=280, height=38, bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=8,
@@ -861,26 +1311,19 @@ ft.Stack([ft.Icon(ft.Icons.NOTIFICATIONS_OUTLINED, color=TEXT_SEC, size=24),
 ft.Container(width=20),
             ft.Row([ft.VerticalDivider(width=1, color=BORDER), ft.Container(width=10),
                 ft.Column([ft.Text(logged_user, size=11, weight=ft.FontWeight.BOLD, color=TEXT_PRI),
-                    ft.Container(content=ft.Text("GOLD MEMBER", size=8, weight=ft.FontWeight.BOLD, color="#DAA520"), bgcolor="#3d2b00", border_radius=4, padding=ps(6, 2))], spacing=2, horizontal_alignment=ft.CrossAxisAlignment.END),
+                    ft.Container(content=ft.Text("GOLD MEMBER", size=8, weight=ft.FontWeight.BOLD, color="#8a6d10" if not page.theme_dark else "#DAA520"), bgcolor="#fff4cc" if not page.theme_dark else "#3d2b00", border_radius=4, padding=ps(6, 2))], spacing=2, horizontal_alignment=ft.CrossAxisAlignment.END),
                 ft.Container(width=10),
-                ft.PopupMenuButton(
-                    tooltip="Account Menu",
+                ft.GestureDetector(
+                    mouse_cursor=ft.MouseCursor.CLICK,
+                    on_tap=lambda e: open_profile_dialog(),
                     content=ft.Container(
                         width=32, height=32,
+                        tooltip="Account",
                         content=ft.Stack([
                             ft.CircleAvatar(content=ft.Text(logged_initials, size=10, weight=ft.FontWeight.BOLD), bgcolor=ACCENT, color=ft.Colors.WHITE, radius=16),
                             ft.Container(bgcolor=ft.Colors.GREEN_ACCENT, width=10, height=10, border_radius=5, right=0, bottom=0, border=ba(2, BG_NAV))
                         ])
-                    ),
-                    items=[
-                        ft.PopupMenuItem(
-                            content=ft.Row([
-                                ft.Icon(ft.Icons.LOGOUT, size=18, color=TEXT_SEC),
-                                ft.Text("Log Out", size=13, color=TEXT_PRI)
-                            ]),
-                            on_click=do_logout
-                        )
-                    ]
+                    )
                 )],
                 spacing=0, vertical_alignment=ft.CrossAxisAlignment.CENTER),
         ]))
@@ -1011,9 +1454,9 @@ ft.Container(width=20),
                             spacing=14,
                             controls=[
                                 ft.Text("Welcome back,", size=45/1.5, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
-                                ft.Text("Nurlan.", size=45/1.5, color=ACCENT2, weight=ft.FontWeight.BOLD),
+                                ft.Text(f"{logged_user}.", size=45/1.5, color=ACCENT2, weight=ft.FontWeight.BOLD),
                                 ft.Text(
-                                    "You've read 124 pages since your last visit. Your current goals are on track for this\nmonth. Explore your dashboard to manage your books and fines.",
+                                    f"You've read {stats['pages_read']} pages since your last visit. Your current goals are on track for this\nmonth. Explore your dashboard to manage your books and fines.",
                                     size=13,
                                     color=TEXT_SEC,
                                 ),
@@ -1069,17 +1512,17 @@ ft.Container(width=20),
                                                         alignment=ft.Alignment(0, 0),
                                                         content=ft.Icon(ft.Icons.MENU_BOOK_OUTLINED, size=18, color="#1a1730"),
                                                     ),
-                                                    ft.Text("SmartLib", size=38/2, color="#8e84b3", weight=ft.FontWeight.W_700),
+                                                    ft.Text("SmartLib", size=38/2, color="#ffffff", weight=ft.FontWeight.W_700),
                                                 ],
                                                 spacing=10,
                                             ),
-                                            ft.Text("CARD HOLDER", size=10, color="#8f86ab", weight=ft.FontWeight.W_600),
-                                            ft.Text("Nurlan Orujov", size=17, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                                            ft.Text("CARD HOLDER", size=10, color="#b8b0d6", weight=ft.FontWeight.W_600),
+                                            ft.Text(logged_user, size=17, color="#ffffff", weight=ft.FontWeight.BOLD),
                                             ft.Row(
                                                 [
-                                                    ft.Column([ft.Text("MEMBER ID", size=10, color="#8f86ab", weight=ft.FontWeight.W_600), ft.Text("SL-9402-2024", size=13, color=TEXT_PRI, weight=ft.FontWeight.W_600)], spacing=2),
+                                                    ft.Column([ft.Text("MEMBER ID", size=10, color="#b8b0d6", weight=ft.FontWeight.W_600), ft.Text(stats["member_id"], size=13, color="#ffffff", weight=ft.FontWeight.W_600)], spacing=2),
                                                     ft.Container(width=24),
-                                                    ft.Column([ft.Text("EXPIRY DATE", size=10, color="#8f86ab", weight=ft.FontWeight.W_600), ft.Text("12 | 2026", size=13, color=TEXT_PRI, weight=ft.FontWeight.W_600)], spacing=2),
+                                                    ft.Column([ft.Text("EXPIRY DATE", size=10, color="#b8b0d6", weight=ft.FontWeight.W_600), ft.Text("12 | 2028", size=13, color="#ffffff", weight=ft.FontWeight.W_600)], spacing=2),
                                                 ]
                                             ),
                                         ],
@@ -1165,10 +1608,10 @@ ft.Container(width=20),
                 ft.Row(
                     spacing=12,
                     controls=[
-                        dashboard_metric_card("Books With You", "5", "3 physical + 2 digital", ACCENT2),
-                        dashboard_metric_card("E-Book Reads", "12", "Current month", TAG_EBOOK),
-                        dashboard_metric_card("Late Fee Due", "$18.50", "Please pay soon", ft.Colors.RED_ACCENT),
-                        dashboard_metric_card("Reading Goal", "5/10", "50% complete", TAG_EBOOK),
+                        dashboard_metric_card("Books With You", str(stats["total"]), f"{stats['physical']} physical + {stats['digital']} digital", ACCENT2),
+                        dashboard_metric_card("E-Book Reads", str(stats["ebook_reads"]), "Current month", TAG_EBOOK),
+                        dashboard_metric_card("Late Fee Due", f"${stats['late_fee']:.2f}", "Please pay soon" if stats["late_fee"] > 0 else "All clear", ft.Colors.RED_ACCENT),
+                        dashboard_metric_card("Reading Goal", f"{stats['goal_done']}/{stats['goal_total']}", f"{int(stats['goal_done']/stats['goal_total']*100)}% complete", TAG_EBOOK),
                     ],
                 ),
                 ft.Row(
@@ -1343,7 +1786,7 @@ ft.Container(width=20),
                                                     [
                                                         ft.Text("Total Unpaid", size=13/1.2, color="#f2cbd1"),
                                                         ft.Container(expand=True),
-                                                        ft.Text("$18.50", size=38/2, color=ft.Colors.RED_ACCENT, weight=ft.FontWeight.BOLD),
+                                                        ft.Text(f"${stats['late_fee']:.2f}", size=38/2, color=ft.Colors.RED_ACCENT, weight=ft.FontWeight.BOLD),
                                                     ]
                                                 ),
                                             ),
@@ -1503,27 +1946,308 @@ ft.Container(width=20),
 
     settings_page = ft.Container(
         bgcolor=BG_DARK, expand=True, padding=ps(40, 30),
-        content=ft.Column(spacing=16, scroll=ft.ScrollMode.AUTO, controls=[
-            ft.Text("Settings", size=28, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
-            ft.Text("Manage registered users — Edit or delete any account.", size=12, color=TEXT_SEC),
-            ft.Divider(color=BORDER, height=1),
-            ft.Row([
-                ft.Icon(ft.Icons.PEOPLE_OUTLINE, color=ACCENT, size=18),
-                ft.Text("User Management (CRUD)", size=15, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
-                ft.Container(expand=True),
-                ft.FilledButton("Refresh", height=32,
-                    on_click=lambda e: reload_users(),
-                    style=ft.ButtonStyle(bgcolor=BG_CARD, color=TEXT_PRI,
-                                         side=ft.BorderSide(1, BORDER),
-                                         shape=ft.RoundedRectangleBorder(radius=8))),
-            ], spacing=10),
-            ft.Text(ref=crud_msg_ref, value="", size=12, color=TAG_EBOOK),
-            ft.Column(ref=crud_list_ref, spacing=10,
-                      controls=[ft.Text("Loading...", size=12, color=TEXT_SEC)]),
-        ])
+        content=ft.Row(alignment=ft.MainAxisAlignment.CENTER, controls=[ft.Container(
+            width=1180,
+            content=ft.Column(spacing=20, scroll=ft.ScrollMode.AUTO, controls=[
+                # ── Page header card ────────────────────────────────
+                ft.Container(
+                    bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=14,
+                    padding=ps(26, 22),
+                    content=ft.Column(spacing=6, controls=[
+                        ft.Row([
+                            ft.Container(content=ft.Icon(ft.Icons.SETTINGS, color=ft.Colors.WHITE, size=18),
+                                         bgcolor=ACCENT, border_radius=8, padding=pa(8)),
+                            ft.Column([
+                                ft.Text("Settings", size=22, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                                ft.Text("Manage registered users — Edit or delete any account.",
+                                        size=12, color=TEXT_SEC),
+                            ], spacing=2),
+                            ft.Container(expand=True),
+
+                        ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ]),
+                ),
+                # ── User Management section card ────────────────────
+                ft.Container(
+                    bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=14,
+                    padding=ps(24, 20),
+                    content=ft.Column(spacing=14, controls=[
+                        ft.Row([
+                            ft.Icon(ft.Icons.PEOPLE_OUTLINE, color=ACCENT, size=18),
+                            ft.Text("User Management (CRUD)", size=15, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                            ft.Container(expand=True),
+                            ft.FilledButton("Refresh", height=34, icon=ft.Icons.REFRESH,
+                                on_click=lambda e: reload_users(),
+                                style=ft.ButtonStyle(bgcolor=BG_NAV, color=TEXT_PRI,
+                                                     side=ft.BorderSide(1, BORDER),
+                                                     shape=ft.RoundedRectangleBorder(radius=8))),
+                        ], spacing=10),
+                        ft.Divider(color=BORDER, height=1),
+                        ft.Text(ref=crud_msg_ref, value="", size=12, color=TAG_EBOOK),
+                        ft.Column(ref=crud_list_ref, spacing=10,
+                                  controls=[ft.Text("Loading...", size=12, color=TEXT_SEC)]),
+                    ]),
+                ),
+            ]),
+        )])
     )
 
-    # ── Hero ────────────────────────────────────────────────
+    # ─── Profile / My Account page ───────────────────────────
+    prof_uname_ref = ft.Ref[ft.TextField]()
+    prof_email_ref = ft.Ref[ft.TextField]()
+    prof_pwd_ref   = ft.Ref[ft.TextField]()
+    prof_msg_ref   = ft.Ref[ft.Text]()
+
+    def save_profile(e):
+        new_u = (prof_uname_ref.current.value or "").strip()
+        new_e = (prof_email_ref.current.value or "").strip()
+        new_p = prof_pwd_ref.current.value or ""
+        if not new_u or not new_e:
+            prof_msg_ref.current.value = "Username and email are required."
+            prof_msg_ref.current.color = ft.Colors.RED_300
+            prof_msg_ref.current.update(); return
+        if " " in new_u or len(new_u) < 3:
+            prof_msg_ref.current.value = "Invalid username (no spaces, min 3 chars)."
+            prof_msg_ref.current.color = ft.Colors.RED_300
+            prof_msg_ref.current.update(); return
+        if "@" not in new_e or " " in new_e:
+            prof_msg_ref.current.value = "Invalid email."
+            prof_msg_ref.current.color = ft.Colors.RED_300
+            prof_msg_ref.current.update(); return
+        if new_p and (len(new_p) < 6 or " " in new_p):
+            prof_msg_ref.current.value = "Password must be 6+ chars and have no spaces."
+            prof_msg_ref.current.color = ft.Colors.RED_300
+            prof_msg_ref.current.update(); return
+
+        ok, msg = db_update_profile(user["id"], new_u, new_e, new_p or None)
+        prof_msg_ref.current.value = msg
+        prof_msg_ref.current.color = TAG_EBOOK if ok else ft.Colors.RED_300
+        prof_msg_ref.current.update()
+        if ok:
+            user["username"] = new_u
+            user["email"] = new_e
+            prof_pwd_ref.current.value = ""
+            prof_pwd_ref.current.update()
+
+    def promote_self_admin(e):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("UPDATE users SET is_admin=1 WHERE id=?", (user.get("id"),))
+            conn.commit(); conn.close()
+            user["is_admin"] = True
+            state["user"] = user
+            set_active_page("AdminBooks")
+        except Exception as ex:
+            prof_msg_ref.current.value = f"Failed: {ex}"
+            prof_msg_ref.current.color = ft.Colors.RED_300
+            prof_msg_ref.current.update()
+
+    def profile_field(label_text, ref, value, password=False):
+        return ft.Column(spacing=6, controls=[
+            ft.Text(label_text.upper(), size=10, color=TEXT_SEC, weight=ft.FontWeight.BOLD),
+            ft.TextField(ref=ref, value=value, password=password, can_reveal_password=password,
+                         text_size=13, color=TEXT_PRI, bgcolor=BG_NAV,
+                         border_color=BORDER, focused_border_color=ACCENT, border_radius=10,
+                         content_padding=ft.Padding(left=14, right=14, top=12, bottom=12)),
+        ])
+
+    profile_page = ft.Container(
+        bgcolor=BG_DARK, expand=True, padding=ps(40, 30),
+        content=ft.Row(alignment=ft.MainAxisAlignment.CENTER, controls=[ft.Container(width=900, content=ft.Column(spacing=20, scroll=ft.ScrollMode.AUTO, controls=[
+            ft.Container(bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=14, padding=ps(26, 22),
+                content=ft.Row(spacing=16, vertical_alignment=ft.CrossAxisAlignment.CENTER, controls=[
+                    ft.CircleAvatar(content=ft.Text(logged_initials, size=18, weight=ft.FontWeight.BOLD),
+                                    bgcolor=ACCENT, color=ft.Colors.WHITE, radius=28),
+                    ft.Column([
+                        ft.Text("My Account", size=22, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                        ft.Text(f"Member ID: {stats['member_id']}", size=12, color=TEXT_SEC),
+                    ], spacing=2),
+                    ft.Container(expand=True),
+                    ft.Container(content=ft.Text("ADMIN" if is_admin else "MEMBER", size=10, weight=ft.FontWeight.BOLD,
+                                  color=ACCENT),
+                                 bgcolor=ft.Colors.with_opacity(0.15, ACCENT),
+                                 padding=ps(10, 6), border_radius=6),
+                ]),
+            ),
+            ft.Container(bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=14, padding=ps(26, 22),
+                content=ft.Column(spacing=16, controls=[
+                    ft.Text("Edit profile", size=15, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                    ft.Divider(color=BORDER, height=1),
+                    profile_field("Username", prof_uname_ref, user.get("username", "")),
+                    profile_field("Email", prof_email_ref, user.get("email", "")),
+                    profile_field("New password (leave blank to keep current)", prof_pwd_ref, "", password=True),
+                    ft.Text(ref=prof_msg_ref, value="", size=12, color=TAG_EBOOK),
+                    ft.Row([
+                        ft.FilledButton("Save changes", icon=ft.Icons.SAVE, on_click=save_profile, height=42,
+                            style=ft.ButtonStyle(bgcolor=ACCENT, color=ft.Colors.WHITE,
+                                                 shape=ft.RoundedRectangleBorder(radius=10),
+                                                 padding=ps(20, 12))),
+                        *([ft.FilledButton("Open Admin Panel", icon=ft.Icons.ADMIN_PANEL_SETTINGS, height=42,
+                            on_click=lambda e: set_active_page("AdminBooks"),
+                            style=ft.ButtonStyle(bgcolor=BG_NAV, color=TEXT_PRI,
+                                                 side=ft.BorderSide(1, ACCENT),
+                                                 shape=ft.RoundedRectangleBorder(radius=10),
+                                                 padding=ps(20, 12)))] if is_admin else []),
+                        *([ft.OutlinedButton("Manage Users", icon=ft.Icons.PEOPLE, height=42,
+                            on_click=lambda e: set_active_page("Settings"),
+                            style=ft.ButtonStyle(color=TEXT_PRI, side=ft.BorderSide(1, BORDER),
+                                                 shape=ft.RoundedRectangleBorder(radius=10),
+                                                 padding=ps(20, 12)))] if is_admin else []),
+                        *([ft.FilledButton("Become Admin", icon=ft.Icons.SHIELD, height=42,
+                            on_click=promote_self_admin,
+                            style=ft.ButtonStyle(bgcolor=ACCENT, color=ft.Colors.WHITE,
+                                                 shape=ft.RoundedRectangleBorder(radius=10),
+                                                 padding=ps(20, 12)))] if not raw_is_admin else []),
+                        *([ft.OutlinedButton("Switch to User View", icon=ft.Icons.PERSON, height=42,
+                            on_click=switch_to_user_view,
+                            style=ft.ButtonStyle(color=TEXT_PRI, side=ft.BorderSide(1, BORDER),
+                                                 shape=ft.RoundedRectangleBorder(radius=10),
+                                                 padding=ps(20, 12)))] if raw_is_admin and not view_as_user else []),
+                        *([ft.FilledButton("Back to Admin View", icon=ft.Icons.ADMIN_PANEL_SETTINGS, height=42,
+                            on_click=switch_to_admin_view,
+                            style=ft.ButtonStyle(bgcolor=ACCENT, color=ft.Colors.WHITE,
+                                                 shape=ft.RoundedRectangleBorder(radius=10),
+                                                 padding=ps(20, 12)))] if raw_is_admin and view_as_user else []),
+                    ], spacing=10, wrap=True),
+                ]),
+            ),
+        ]))])
+    )
+
+    # ─── My Books page ───────────────────────────────────────
+    def loan_row(title, author, due_in_days, kind):
+        overdue = due_in_days < 0
+        chip_col = ft.Colors.RED_ACCENT if overdue else (ft.Colors.AMBER if due_in_days <= 3 else TAG_EBOOK)
+        chip_txt = f"{abs(due_in_days)}d overdue" if overdue else f"Due in {due_in_days}d"
+        return ft.Container(bgcolor=BG_NAV, border=ba(1, BORDER), border_radius=10, padding=ps(16, 14),
+            content=ft.Row(vertical_alignment=ft.CrossAxisAlignment.CENTER, controls=[
+                ft.Container(width=42, height=42, border_radius=8, bgcolor=ft.Colors.with_opacity(0.15, ACCENT),
+                             alignment=ft.Alignment(0, 0),
+                             content=ft.Icon(ft.Icons.MENU_BOOK if kind == "Physical" else ft.Icons.TABLET_MAC,
+                                             color=ACCENT, size=20)),
+                ft.Container(width=14),
+                ft.Column(expand=True, spacing=2, controls=[
+                    ft.Text(title, size=14, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                    ft.Text(f"by {author} · {kind}", size=11, color=TEXT_SEC),
+                ]),
+                ft.Container(content=ft.Text(chip_txt, size=10, color=chip_col, weight=ft.FontWeight.BOLD),
+                             bgcolor=ft.Colors.with_opacity(0.15, chip_col), padding=ps(10, 6), border_radius=6),
+                ft.Container(width=10),
+                ft.OutlinedButton("Return", icon=ft.Icons.UNDO, height=36,
+                    style=ft.ButtonStyle(color=TEXT_PRI, side=ft.BorderSide(1, BORDER),
+                                         shape=ft.RoundedRectangleBorder(radius=8))),
+            ]))
+
+    # Deterministic loans derived from the user's seed
+    _seed = (int(user.get("id", 0) or 0) * 2654435761) & 0xFFFFFFFF
+    _book_pool = [(b["title"], b["author"], b["tag"]) for b in BOOKS]
+    _loans = []
+    for i in range(stats["total"]):
+        bk = _book_pool[(_seed >> (i + 1)) % len(_book_pool)]
+        due = ((_seed >> (i * 3 + 2)) % 21) - 5  # -5..15
+        _loans.append((bk[0], bk[1], due, bk[2]))
+
+    mybooks_page = ft.Container(
+        bgcolor=BG_DARK, expand=True, padding=ps(40, 30),
+        content=ft.Row(alignment=ft.MainAxisAlignment.CENTER, controls=[ft.Container(width=1180, content=ft.Column(spacing=20, scroll=ft.ScrollMode.AUTO, controls=[
+            ft.Container(bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=14, padding=ps(26, 22),
+                content=ft.Row(vertical_alignment=ft.CrossAxisAlignment.CENTER, controls=[
+                    ft.Container(content=ft.Icon(ft.Icons.LIBRARY_BOOKS, color=ft.Colors.WHITE, size=18),
+                                 bgcolor=ACCENT, border_radius=8, padding=pa(8)),
+                    ft.Column([
+                        ft.Text("My Books", size=22, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                        ft.Text(f"You currently have {stats['total']} active loans ({stats['physical']} physical, {stats['digital']} digital).",
+                                size=12, color=TEXT_SEC),
+                    ], spacing=2),
+                ], spacing=14),
+            ),
+            ft.Container(bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=14, padding=ps(20, 18),
+                content=ft.Column(spacing=10, controls=(
+                    [loan_row(t, a, d, k) for (t, a, d, k) in _loans]
+                    if _loans else
+                    [ft.Container(padding=ps(0, 30), alignment=ft.Alignment(0, 0),
+                        content=ft.Column(horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=8, controls=[
+                            ft.Icon(ft.Icons.INBOX_OUTLINED, color=TEXT_SEC, size=36),
+                            ft.Text("No active loans", size=14, color=TEXT_PRI, weight=ft.FontWeight.W_600),
+                            ft.Text("Borrow a book from the catalog to see it here.", size=11, color=TEXT_SEC),
+                        ]))]
+                )),
+            ),
+        ]))])
+    )
+
+    # ─── Fines page ──────────────────────────────────────────
+    _fines = []
+    if stats["late_fee"] > 0:
+        remaining = stats["late_fee"]
+        for i, (title, _, due, _kind) in enumerate(_loans):
+            if due < 0 and remaining > 0:
+                amt = round(min(remaining, abs(due) * 1.5 + 0.5), 2)
+                _fines.append((title, abs(due), amt))
+                remaining = round(remaining - amt, 2)
+        if remaining > 0:
+            _fines.append(("Miscellaneous late fee", 1, remaining))
+
+    fines_page = ft.Container(
+        bgcolor=BG_DARK, expand=True, padding=ps(40, 30),
+        content=ft.Row(alignment=ft.MainAxisAlignment.CENTER, controls=[ft.Container(width=1180, content=ft.Column(spacing=20, scroll=ft.ScrollMode.AUTO, controls=[
+            ft.Container(bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=14, padding=ps(26, 22),
+                content=ft.Row(vertical_alignment=ft.CrossAxisAlignment.CENTER, controls=[
+                    ft.Container(content=ft.Icon(ft.Icons.RECEIPT_LONG, color=ft.Colors.WHITE, size=18),
+                                 bgcolor=ft.Colors.RED_400, border_radius=8, padding=pa(8)),
+                    ft.Column([
+                        ft.Text("Fines & Payments", size=22, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                        ft.Text("Outstanding late fees and recent payment activity.", size=12, color=TEXT_SEC),
+                    ], spacing=2),
+                    ft.Container(expand=True),
+                    ft.Column(horizontal_alignment=ft.CrossAxisAlignment.END, spacing=2, controls=[
+                        ft.Text("TOTAL DUE", size=10, color=TEXT_SEC, weight=ft.FontWeight.BOLD),
+                        ft.Text(f"${stats['late_fee']:.2f}", size=22,
+                                color=ft.Colors.RED_ACCENT if stats['late_fee'] > 0 else TAG_EBOOK,
+                                weight=ft.FontWeight.BOLD),
+                    ]),
+                ], spacing=14),
+            ),
+            ft.Container(bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=14, padding=ps(24, 20),
+                content=ft.Column(spacing=12, controls=(
+                    [
+                        ft.Row([
+                            ft.Text("Item", size=10, color=TEXT_SEC, weight=ft.FontWeight.BOLD, expand=True),
+                            ft.Text("Days late", size=10, color=TEXT_SEC, weight=ft.FontWeight.BOLD, width=90),
+                            ft.Text("Amount", size=10, color=TEXT_SEC, weight=ft.FontWeight.BOLD, width=90),
+                        ]),
+                        ft.Divider(color=BORDER, height=1),
+                    ] + [
+                        ft.Row([
+                            ft.Text(title, size=13, color=TEXT_PRI, expand=True),
+                            ft.Text(f"{days}d", size=13, color=TEXT_SEC, width=90),
+                            ft.Text(f"${amt:.2f}", size=13, color=ft.Colors.RED_ACCENT,
+                                    weight=ft.FontWeight.BOLD, width=90),
+                        ]) for (title, days, amt) in _fines
+                    ] + [
+                        ft.Divider(color=BORDER, height=1),
+                        ft.Row([
+                            ft.Container(expand=True),
+                            ft.FilledButton("Pay all now", icon=ft.Icons.CREDIT_CARD, height=42,
+                                style=ft.ButtonStyle(bgcolor=ft.Colors.RED_ACCENT, color=ft.Colors.WHITE,
+                                                     shape=ft.RoundedRectangleBorder(radius=10),
+                                                     padding=ps(20, 12))),
+                        ]),
+                    ]
+                    if _fines else
+                    [ft.Container(padding=ps(0, 30), alignment=ft.Alignment(0, 0),
+                        content=ft.Column(horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=8, controls=[
+                            ft.Icon(ft.Icons.CHECK_CIRCLE_OUTLINE, color=TAG_EBOOK, size=44),
+                            ft.Text("All clear!", size=16, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                            ft.Text("You have no outstanding fines. Keep it up!", size=12, color=TEXT_SEC),
+                        ]))]
+                )),
+            ),
+        ]))])
+    )
+
+
     hero_grad_1 = "#2a1040" if page.theme_dark else "#efe8ff"
     hero_grad_2 = "#0f0a1a" if page.theme_dark else "#f8f5ff"
     hero_badge_bg = "#252535" if page.theme_dark else "#e9defa"
@@ -1714,7 +2438,7 @@ ft.Container(width=20),
             ft.Container(bgcolor=BG_NAV, border_radius=12, border=ba(1, BORDER), padding=ps(16, 12),
                 content=ft.Row([ft.Icon(ft.Icons.TUNE, size=14, color=TEXT_SEC), ft.Text("Advanced Search and Filter Options", size=12, color=TEXT_SEC)], spacing=10)),
             ft.Container(height=34),
-            ft.Row(ref=grid_ref, controls=[book_card(b, page, state["view_mode"]) for b in BOOKS], wrap=True, spacing=16, run_spacing=24),
+            ft.Row(ref=grid_ref, controls=[book_card(b, page, state["view_mode"]) for b in all_books()], wrap=True, spacing=16, run_spacing=24),
             ft.Container(height=40),
             ft.Container(bgcolor=BG_CARD, border_radius=12, border=ba(1, BORDER), alignment=ft.Alignment(0, 0), padding=ps(0, 34),
                 content=ft.Column(horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=4, controls=[
@@ -1740,12 +2464,183 @@ ft.Container(width=20),
             ft.Row([ft.Text("© 2026 SMART LIBRARY. ALL RIGHTS RESERVED.", size=10, color=TEXT_SEC), ft.Container(expand=True),
                 ft.Text("SYSTEM ONLINE", size=10, color=TAG_EBOOK), ft.Container(width=18), ft.Text("VERSION 2.1.0", size=10, color=TEXT_SEC)])]))
 
+    def centered(child, max_w=1400):
+        return ft.Container(
+            bgcolor=BG_DARK, expand=True,
+            content=ft.Row(alignment=ft.MainAxisAlignment.CENTER, controls=[
+                ft.Container(width=max_w, content=child)
+            ])
+        )
+
+    # ─── Admin Books CRUD page ───────────────────────────────────
+    bk_list_ref  = ft.Ref[ft.Column]()
+    bk_msg_ref   = ft.Ref[ft.Text]()
+    bk_title_ref = ft.Ref[ft.TextField]()
+    bk_auth_ref  = ft.Ref[ft.TextField]()
+    bk_genre_ref = ft.Ref[ft.TextField]()
+    bk_tag_ref   = ft.Ref[ft.Dropdown]()
+    bk_cover_ref = ft.Ref[ft.TextField]()
+
+    def _bk_msg(text, ok=True):
+        if bk_msg_ref.current:
+            bk_msg_ref.current.value = text
+            bk_msg_ref.current.color = TAG_EBOOK if ok else ft.Colors.RED_300
+            bk_msg_ref.current.update()
+
+    def build_book_row(bid, title, author, genre, tag, cover):
+        t_field = ft.TextField(value=title, label="Title", text_size=12, color=TEXT_PRI, bgcolor=BG_CARD,
+                               border_color=BORDER, focused_border_color=ACCENT, border_radius=8,
+                               content_padding=ft.Padding(left=10, right=10, top=8, bottom=8), expand=True)
+        a_field = ft.TextField(value=author, label="Author", text_size=12, color=TEXT_PRI, bgcolor=BG_CARD,
+                               border_color=BORDER, focused_border_color=ACCENT, border_radius=8,
+                               content_padding=ft.Padding(left=10, right=10, top=8, bottom=8), expand=True)
+        g_field = ft.TextField(value=genre or "", label="Genre", text_size=12, color=TEXT_PRI, bgcolor=BG_CARD,
+                               border_color=BORDER, focused_border_color=ACCENT, border_radius=8,
+                               content_padding=ft.Padding(left=10, right=10, top=8, bottom=8), expand=True)
+        tag_dd = ft.Dropdown(value=tag or "Physical", width=130, text_size=12, color=TEXT_PRI, bgcolor=BG_CARD,
+                             border_color=BORDER, focused_border_color=ACCENT, border_radius=8,
+                             content_padding=ft.Padding(left=10, right=10, top=8, bottom=8),
+                             options=[ft.dropdown.Option("Physical"), ft.dropdown.Option("E-Book")])
+        c_field = ft.TextField(value=cover or "", label="Cover URL", text_size=12, color=TEXT_PRI, bgcolor=BG_CARD,
+                               border_color=BORDER, focused_border_color=ACCENT, border_radius=8,
+                               content_padding=ft.Padding(left=10, right=10, top=8, bottom=8), expand=True)
+
+        def on_save(e):
+            ok, msg = db_book_update(bid, t_field.value, a_field.value, g_field.value,
+                                     tag_dd.value or "Physical", c_field.value)
+            _bk_msg(msg, ok)
+            if ok:
+                reload_books()
+
+        def on_delete(e):
+            db_book_delete(bid)
+            _bk_msg(f"Book #{bid} deleted.", ok=False)
+            reload_books()
+
+        return ft.Container(
+            bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=10, padding=pa(14),
+            content=ft.Column(spacing=8, controls=[
+                ft.Row([
+                    ft.Text(f"#{bid}", size=11, color=ACCENT, weight=ft.FontWeight.BOLD, width=40),
+                    ft.Text(f"{tag}", size=10, color=TEXT_SEC),
+                ]),
+                ft.Row([t_field, a_field], spacing=10),
+                ft.Row([g_field, tag_dd, c_field], spacing=10),
+                ft.Row([
+                    ft.FilledButton("Save", height=32, on_click=on_save,
+                        style=ft.ButtonStyle(bgcolor=ACCENT, color=ft.Colors.WHITE,
+                                             shape=ft.RoundedRectangleBorder(radius=8))),
+                    ft.FilledButton("Delete", height=32, on_click=on_delete,
+                        style=ft.ButtonStyle(bgcolor=ft.Colors.RED_400, color=ft.Colors.WHITE,
+                                             shape=ft.RoundedRectangleBorder(radius=8))),
+                ], spacing=10),
+            ])
+        )
+
+    def reload_books():
+        if not bk_list_ref.current:
+            return
+        rows = db_books_all()
+        bk_list_ref.current.controls = [
+            build_book_row(*r) for r in rows
+        ] if rows else [ft.Text("No books yet. Add one above.", size=12, color=TEXT_SEC)]
+        bk_list_ref.current.update()
+
+    def on_add_book(e):
+        ok, msg = db_book_create(
+            bk_title_ref.current.value or "",
+            bk_auth_ref.current.value or "",
+            bk_genre_ref.current.value or "",
+            bk_tag_ref.current.value or "Physical",
+            bk_cover_ref.current.value or "",
+        )
+        _bk_msg(msg, ok)
+        if ok:
+            for r in (bk_title_ref, bk_auth_ref, bk_genre_ref, bk_cover_ref):
+                r.current.value = ""
+                r.current.update()
+            reload_books()
+
+    def _bk_input(ref, label, expand=True, width=None):
+        return ft.TextField(ref=ref, label=label, text_size=12, color=TEXT_PRI, bgcolor=BG_CARD,
+                            border_color=BORDER, focused_border_color=ACCENT, border_radius=8,
+                            content_padding=ft.Padding(left=10, right=10, top=8, bottom=8),
+                            expand=expand if width is None else False, width=width)
+
+    admin_books_page = ft.Container(
+        bgcolor=BG_DARK, expand=True, padding=ps(40, 30),
+        content=ft.Row(alignment=ft.MainAxisAlignment.CENTER, controls=[ft.Container(
+            width=1180,
+            content=ft.Column(spacing=20, scroll=ft.ScrollMode.AUTO, controls=[
+                # Header
+                ft.Container(bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=14, padding=ps(26, 22),
+                    content=ft.Row(spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER, controls=[
+                        ft.Container(content=ft.Icon(ft.Icons.LIBRARY_ADD, color=ft.Colors.WHITE, size=18),
+                                     bgcolor=ACCENT, border_radius=8, padding=pa(8)),
+                        ft.Column([
+                            ft.Text("Manage Books (CRUD)", size=22, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                            ft.Text("Add, edit and remove books in the library catalog.", size=12, color=TEXT_SEC),
+                        ], spacing=2),
+                        ft.Container(expand=True),
+
+                    ])),
+                # Add new book card
+                ft.Container(bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=14, padding=ps(24, 20),
+                    content=ft.Column(spacing=12, controls=[
+                        ft.Row([
+                            ft.Icon(ft.Icons.ADD_CIRCLE_OUTLINE, color=ACCENT, size=18),
+                            ft.Text("Add a new book", size=15, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                        ], spacing=10),
+                        ft.Divider(color=BORDER, height=1),
+                        ft.Row([_bk_input(bk_title_ref, "Title"), _bk_input(bk_auth_ref, "Author")], spacing=10),
+                        ft.Row([
+                            _bk_input(bk_genre_ref, "Genre"),
+                            ft.Dropdown(ref=bk_tag_ref, label="Type", value="Physical", width=160,
+                                text_size=12, color=TEXT_PRI, bgcolor=BG_CARD,
+                                border_color=BORDER, focused_border_color=ACCENT, border_radius=8,
+                                options=[ft.dropdown.Option("Physical"), ft.dropdown.Option("E-Book")]),
+                            _bk_input(bk_cover_ref, "Cover URL (optional)"),
+                        ], spacing=10),
+                        ft.Row([
+                            ft.FilledButton("Add Book", icon=ft.Icons.ADD, height=38, on_click=on_add_book,
+                                style=ft.ButtonStyle(bgcolor=ACCENT, color=ft.Colors.WHITE,
+                                                     shape=ft.RoundedRectangleBorder(radius=8))),
+                            ft.OutlinedButton("Refresh", icon=ft.Icons.REFRESH, height=38,
+                                on_click=lambda e: reload_books(),
+                                style=ft.ButtonStyle(color=TEXT_PRI, side=ft.BorderSide(1, BORDER),
+                                                     shape=ft.RoundedRectangleBorder(radius=8))),
+                        ], spacing=10),
+                        ft.Text(ref=bk_msg_ref, value="", size=12, color=TAG_EBOOK),
+                    ])),
+                # List
+                ft.Container(bgcolor=BG_CARD, border=ba(1, BORDER), border_radius=14, padding=ps(24, 20),
+                    content=ft.Column(spacing=14, controls=[
+                        ft.Row([
+                            ft.Icon(ft.Icons.MENU_BOOK, color=ACCENT, size=18),
+                            ft.Text("All books", size=15, color=TEXT_PRI, weight=ft.FontWeight.BOLD),
+                        ], spacing=10),
+                        ft.Divider(color=BORDER, height=1),
+                        ft.Column(ref=bk_list_ref, spacing=10,
+                                  controls=[ft.Text("Loading...", size=12, color=TEXT_SEC)]),
+                    ])),
+            ]),
+        )])
+    )
+
     if state["active_page"] == "Dashboard":
-        main_content = ft.Column(spacing=0, controls=[dashboard, footer])
-    elif state["active_page"] == "Settings":
+        main_content = ft.Column(spacing=0, controls=[centered(dashboard), footer])
+    elif state["active_page"] == "Settings" and is_admin:
         main_content = settings_page
+    elif state["active_page"] == "AdminBooks" and is_admin:
+        main_content = admin_books_page
+    elif state["active_page"] == "Profile":
+        main_content = profile_page
+    elif state["active_page"] == "MyBooks":
+        main_content = mybooks_page
+    elif state["active_page"] == "Fines":
+        main_content = fines_page
     else:
-        main_content = ft.Column(spacing=0, controls=[hero, catalog, footer])
+        main_content = ft.Column(spacing=0, controls=[hero, centered(catalog), footer])
 
     page.add(ft.Column(spacing=0, expand=True, controls=[navbar, main_content]))
 
