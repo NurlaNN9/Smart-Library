@@ -1,5 +1,5 @@
 #   pip install fastapi uvicorn requests
-#   uvicorn api:app --reload --port 8000
+#   uvicorn lab8_api:app --reload --port 8000
 
 from fastapi import FastAPI, HTTPException
 import sqlite3

@@ -1,5 +1,5 @@
 # How to run:
-#   1) In one terminal:   uvicorn api:app --reload --port 8000
+#   1) In one terminal:   uvicorn lab8_api:app --reload --port 8000
 #   2) In another:        python lab8_main_demo.py
 # ============================================================
 
